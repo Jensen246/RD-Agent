@@ -340,9 +340,8 @@ component_spec:
       - Calculate the metric (mentioned in the evaluation section of the competition information) for each model and ensemble strategy on valid, and save the results in `scores.csv`
       - The evaluation should be based on k-fold cross-validation but only if that's an appropriate evaluation for the task at hand. Store the mean validation score of k-fold cross-validation in `scores.csv` on each model. Refer to the hyperparameter specification for rules to set the CV folds.
       - Even if only one model is present, compute the ensemble score and store it under `"ensemble"`.
-      - The index of `scores.csv` should include the model name and the "ensemble" strategy. "ensemble" should be exactly in the index with all lower case letters. Ensemble is the result from several models. If only one model is present, the ensemble score should be the same as the model score.
-      - The column names in `scores.csv` should be ["{{ metric_name }}"] where metric_name is the name of the metric used for evaluation. Only one column is required.
-      - The column name should be exactly the same to "{{ metric_name }}" since user will use it to pick the result.
+      - The index of `scores.csv` should include the model name and the "ensemble" strategy. "ensemble" should be exactly in the index with all lower case letters (CASE-SENSITIVE). Ensemble is the result from several models. If only one model is present, the ensemble score should be the same as the model score.
+      - The column names in `scores.csv` should be ["{{ metric_name }}"] where metric_name is the name of the metric used for evaluation. Only one column is required. The column name should be exactly the same as "{{ metric_name }}" (CASE-SENSITIVE) since user will use it to pick the result.
       - Validation metrics should be aligned across all ideas and implementations. Avoid proposing ideas that might affect the validation metrics and modifying the related code.
 
     9. Submission File:
@@ -350,16 +349,19 @@ component_spec:
       - Present the required submission format explicitly and ensure the output adheres to it.
     
     10. Preferred Packages:
-      - You can choose the most proper packages to achieve the task.
-      - When facing a choice between two packages which both can achieve the same goal, you should choose the one which is more commonly used and less likely to cause bugs in coding. Especially those you are not familiar with.
-      - For GBDT models, prefer XGBoost or RandomForest over LightGBM unless the SOTA or hypothesis dictates otherwise.
-      - For neural networks, prefer PyTorch or PyTorch based library (over TensorFlow) unless the SOTA or hypothesis dictates otherwise.
-      - For neural networks, prefer fine-tuning pre-trained models over training from scratch.
+      {% include "scenarios.data_science.share:guidelines.package_selection" %}
 
 guidelines:
   coding: |-
     You might receive exploratory data analysis (EDA) details about the source data. **Do not use this EDA information to create assertions, hard-coded values, or raise errors.** We might generate sample data for quick coding (so your code may run on sample data which is part of the full-size data), but remember that the EDA details are based on the full-size data.
-
+  package_selection: |-
+    - The `Available Packages` section in the Competition Scenario Description includes general and specific recommendations. Choose packages that best support the hypothesis and constraints; you may deviate with clear justification grounded in data, code reuse, and efficiency.
+    - Do not select packages solely because you are familiar with them.
+    - When facing a choice between two packages which both can achieve the same goal, you should choose the one which is more commonly used and less likely to cause bugs in coding.
+    - For GBDT, prefer CPU. Enable GPU for GBDT if profiling on this environment shows clear, reproducible speedups without stability regressions; document the versions and settings used.
+    - For deep learning frameworks, align with the current codebase and available pretrained assets. If unconstrained, prefer PyTorch or PyTorch‑based libraries given ecosystem and template support; prioritize consistency and reuse over brand preferences.
+    - For neural networks, favor fine-tuning well‑validated pretrained models over training from scratch when applicable to the task.
+    
 spec:
   hyperparameter: |-
     1. Hyperparameters Requiring Tuning (e.g., learning rate, weight decay, optimizer, etc.)
