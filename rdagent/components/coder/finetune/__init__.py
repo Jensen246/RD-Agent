@@ -56,42 +56,115 @@ class LLMFinetuneEvolvingStrategy(MultiProcessEvolvingStrategy):
         workspace: FBWorkspace | None = None,
         prev_task_feedback: CoSTEERSingleFeedback | None = None,
     ) -> dict[str, str]:
-        """Implement a single fine-tuning task by generating LlamaFactory config"""
+        """Convert JSON hypothesis to LlamaFactory YAML config"""
 
-        task_info = target_task.get_task_information()
+        # Get hypothesis from task (attached by FTHypothesis2Experiment)
+        hypothesis = getattr(target_task, "_parent_experiment_hypothesis", None)
+        
+        if hypothesis and hasattr(hypothesis, "hypothesis_json") and hypothesis.hypothesis_json:
+            # New path: Direct JSON to YAML conversion (no LLM needed)
+            logger.info("Converting JSON hypothesis to YAML configuration")
+            config_yaml = self._convert_json_to_yaml(
+                hypothesis_json=hypothesis.hypothesis_json,
+                base_model=getattr(target_task, "base_model"),
+                dataset=getattr(target_task, "dataset"),
+                debug_mode=True,
+            )
+        else:
+            # Fallback: Use legacy method (backward compatibility)
+            logger.warning("No hypothesis JSON found, falling back to legacy config generation")
+            task_info = target_task.get_task_information()
+            similar_knowledge = (
+                queried_knowledge.task_to_similar_task_successful_knowledge.get(task_info, []) if queried_knowledge else []
+            )
+            failed_knowledge = (
+                queried_knowledge.task_to_former_failed_traces.get(task_info, ([], None))
+                if queried_knowledge
+                else ([], None)
+            )
+            
+            config_yaml = self._generate_llamafactory_config_with_llm(
+                base_model=getattr(target_task, "base_model"),
+                finetune_method=getattr(target_task, "finetune_method"),
+                dataset=getattr(target_task, "dataset"),
+                debug_mode=True,
+                task_info=task_info,
+                similar_knowledge=similar_knowledge,
+                failed_knowledge=failed_knowledge[0],
+                prev_feedback=prev_task_feedback,
+                workspace=workspace,
+            )
 
-        # Query relevant knowledge
-        similar_knowledge = (
-            queried_knowledge.task_to_similar_task_successful_knowledge.get(task_info, []) if queried_knowledge else []
-        )
-
-        failed_knowledge = (
-            queried_knowledge.task_to_former_failed_traces.get(task_info, ([], None))
-            if queried_knowledge
-            else ([], None)
-        )
-
-        # Get task parameters from the task object
-        base_model = getattr(target_task, "base_model")
-        finetune_method = getattr(target_task, "finetune_method")
-        dataset = getattr(target_task, "dataset")
-
-        # Use LLM to generate LlamaFactory config YAML
-        # For coding stage, use debug mode with limited samples
-        config_yaml = self._generate_llamafactory_config_with_llm(
-            base_model=base_model,
-            finetune_method=finetune_method,
-            dataset=dataset,
-            debug_mode=True,  # Use debug mode for coding stage (limited samples for quick validation)
-            task_info=task_info,
-            similar_knowledge=similar_knowledge,
-            failed_knowledge=failed_knowledge[0],
-            prev_feedback=prev_task_feedback,
-            workspace=workspace,
-        )
-
-        # Return generated config directly - validation happens in evaluator
         return {"train.yaml": config_yaml}
+    
+    def _convert_json_to_yaml(
+        self,
+        hypothesis_json: dict,
+        base_model: str,
+        dataset: str,
+        debug_mode: bool = True,
+    ) -> str:
+        """Convert JSON hypothesis to LlamaFactory YAML configuration
+        
+        Direct conversion without LLM - simply flattens JSON and adds system parameters.
+        
+        Args:
+            hypothesis_json: JSON hypothesis from ExpGen
+            base_model: Base model name
+            dataset: Dataset name
+            debug_mode: Whether to use debug settings
+            
+        Returns:
+            YAML configuration string
+        """
+        # Flatten nested JSON to config dict
+        config = self._flatten_dict(hypothesis_json)
+        
+        # Remove non-parameter fields (like reasoning, explanations, etc.)
+        meta_keys = ["reasoning", "reason", "rationale", "why", "explanation", 
+                     "expected_outcome", "outcome", "changes", "changes_from_previous"]
+        for key in meta_keys:
+            config.pop(key, None)
+        
+        # Add system-required parameters
+        config.update({
+            "model_name_or_path": f"/assets/models/{base_model}",
+            "dataset": dataset,
+            "dataset_dir": "/assets/datasets/",
+            "output_dir": "/workspace/output",
+            "do_train": True,
+            "overwrite_output_dir": True,
+            "logging_steps": 10,
+            "save_steps": 500,
+            "plot_loss": True,
+            "report_to": "none",
+        })
+        
+        # Debug mode settings
+        if debug_mode:
+            config["max_samples"] = 100
+            if "num_train_epochs" in config:
+                config["num_train_epochs"] = min(config["num_train_epochs"], 1)
+        
+        # Hardware adaptation
+        config.setdefault("bf16", True)
+        
+        # Generate YAML
+        yaml_str = yaml.dump(config, default_flow_style=False, sort_keys=False)
+        logger.info(f"Generated YAML config with {len(config)} parameters")
+        return yaml_str
+    
+    def _flatten_dict(self, d: dict, parent_key: str = "", sep: str = "_") -> dict:
+        """Recursively flatten nested dictionary"""
+        items = []
+        for k, v in d.items():
+            new_key = f"{parent_key}{sep}{k}" if parent_key else k
+            if isinstance(v, dict):
+                # Recursively flatten
+                items.extend(self._flatten_dict(v, new_key, sep=sep).items())
+            else:
+                items.append((new_key, v))
+        return dict(items)
 
     def _generate_llamafactory_config_with_llm(
         self,

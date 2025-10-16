@@ -1,60 +1,101 @@
-hypothesis_gen:
-  system_prompt: |-
-    You are an expert in LLM fine-tuning. Your task is to select the optimal configuration based on hardware constraints and dataset characteristics.
-
-    ## Task
-    {% if specified_model %}
-    Select the optimal fine-tuning method and quantization strategy for the specified model.
-    {% else %}
-    Select the optimal combination of base model, fine-tuning method, and quantization strategy.
-    {% endif %}
-
-    ## Available Options
-
-    {% if not specified_model %}
-    **Available Models** (showing first 10):
-    {{ available_models }}
-    {% endif %}
-
-    **Fine-tuning Methods**:
-    {{ available_methods }}
-
-    **Quantization Options**:
-    - none: No quantization (highest quality, most memory usage)
-    - 4bit: 4-bit quantization (good balance of quality and memory)
-    - 8bit: 8-bit quantization (memory efficient)
-
-    ## Selection Criteria
-    1. **Memory Constraints**: Consider GPU memory size to choose appropriate model size and quantization
-    2. **Task Requirements**: Select fine-tuning method based on dataset characteristics
-    3. **Quality Balance**: Achieve best performance within resource constraints
-
+expgen:
+  system: |-
+    You are an expert LLM fine-tuning researcher. Design an optimal experiment configuration.
+    
+    You have access to {{ parameters_count }} parameters covering all aspects of LLM fine-tuning.
+    
+    ## Technical Constraints (from LlamaFactory)
+    {{ constraints }}
+    
     ## Output Format
-    {% if specified_model %}
-    {{ specified_model }}|method|quantization
-    {% else %}
-    model_name|method|quantization
+    Output a JSON object with your parameter decisions. Use any structure you prefer - the keys and nesting are completely up to you.
+    
+    **Always include**:
+    - A "reasoning" field explaining your key decisions
+    - Parameter names and values you want to set
+    
+    **Example formats** (choose any structure):
+    
+    ```json
+    {
+      "reasoning": "16GB GPU needs memory efficiency, using QLoRA...",
+      "quantization_bit": 4,
+      "finetuning_type": "lora",
+      "lora_rank": 8,
+      "learning_rate": 0.0001,
+      "num_train_epochs": 3,
+      ...
+    }
+    ```
+    
+    Or nested:
+    ```json
+    {
+      "reasoning": "...",
+      "model": {
+        "quantization_bit": 4,
+        "quantization_method": "bitsandbytes"
+      },
+      "lora": {
+        "rank": 8,
+        "alpha": 16
+      },
+      "training": {
+        "learning_rate": 0.0001,
+        "epochs": 3
+      }
+    }
+    ```
+    
+    Or flat:
+    ```json
+    {
+      "why": "...",
+      "quant": 4,
+      "method": "lora",
+      "lr": 0.0001,
+      ...
+    }
+    ```
+    
+    **Use parameter names from the available parameters list below. Omitted parameters will use LlamaFactory defaults.**
+
+  user: |-
+    ## Task Information
+    - **Dataset**: {{ task.dataset }}
+    - **Base Model**: {{ task.base_model }}
+    - **GPU Memory**: {{ task.gpu_memory_gb }}GB
+    - **Dataset Size**: {{ task.dataset_info.sample_count }} samples, {{ task.dataset_info.total_size_mb }}MB
+    
+    ## Available Parameters ({{ parameters|length }} parameters, format: name: type = default)
+    ```
+    {% for key, value in parameters.items() %}
+    {{ key }}: {{ value }}
+    {% endfor %}
+    ```
+    
+    ## Available Choices for Enums
+    ```
+    {{ choices }}
+    ```
+    
+    {% if has_feedback %}
+    ## Previous Experiment #{{ feedback.experiment_id }}
+    
+    **Previous Configuration**:
+    ```json
+    {{ feedback.hypothesis_json | tojson(indent=2) }}
+    ```
+    
+    **Status**: {{ feedback.status }}
+    {% if feedback.observations %}
+    **Observations**: {{ feedback.observations }}
     {% endif %}
-
-    Example: Qwen/Qwen2.5-1.5B-Instruct|lora|4bit
-
-  user_prompt: |-
-    ## Hardware Information
-    - GPU Memory: {{ memory_gb }}GB
-    - GPU Name: {{ gpu_name }}
-    - GPU Number: {{ gpu_count }}
-
-    ## Dataset Information
-    - Name: {{ dataset_name }}
-    - Sample: {{ first_sample }}
-    - Sample Count: {{ dataset_sample_count }} samples
-    - Total Size: {{ dataset_total_size_mb }} MB
-
-    {% if specified_model %}
-    ## Specified Model
-    {{ specified_model }}
-
-    Please select the optimal fine-tuning method and quantization strategy for this model, considering the hardware constraints and dataset characteristics above.
+    {% if feedback.suggestions %}
+    **Suggestions**: {{ feedback.suggestions }}
+    {% endif %}
+    
+    Design an improved configuration based on this feedback.
     {% else %}
-    Please select the optimal combination of model, fine-tuning method, and quantization strategy based on the hardware constraints and dataset characteristics above.
+    This is the first experiment. Design an optimal configuration.
     {% endif %}
