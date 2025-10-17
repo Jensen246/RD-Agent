@@ -179,5 +179,7 @@ rdagent/app/benchmark/factor/example.json
 videos/
 static/
 
-.claude
-.cursor
+# AI assistant
+.cursor/
+.claude/
+AGENTS.md
