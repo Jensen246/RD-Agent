@@ -65,6 +65,12 @@ class LLMFinetunePropSetting(ExtendedBaseSettings):
     # LLaMA Factory
     update_llama_factory: bool = True
 
+    # MCP parameter search
+    enable_mcp_param_search: bool = True
+    """Enable MCP-based parameter search for LLaMA Factory.
+    Requires llama_factory_server running on port 8124 (default).
+    Set FT_ENABLE_MCP_PARAM_SEARCH=false to disable."""
+
     # Docker settings
     docker_enable_cache: bool = False
     """Enable Docker cache for training (set via FT_DOCKER_ENABLE_CACHE)"""

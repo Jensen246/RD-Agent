@@ -17,6 +17,7 @@ WORKDIR /llamafactory
 
 # Install LLaMA-Factory with torch and metrics extras
 RUN PIP_NO_BUILD_ISOLATION=1 pip install -e ".[torch,metrics]"
+# RUN PIP_NO_BUILD_ISOLATION=1 pip install -e ".[torch,metrics,deepspeed,bitsandbytes]"
 
 # Set working directory for experiments
 WORKDIR /workspace

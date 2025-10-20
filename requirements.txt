@@ -71,3 +71,7 @@ types-pytz
 # Agent
 pydantic-ai[mcp,openai,prefect]  # Full version with Prefect support
 nest-asyncio
+
+# MCP Server
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0

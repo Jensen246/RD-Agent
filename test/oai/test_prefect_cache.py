@@ -2,7 +2,8 @@ import time
 import unittest
 
 from rdagent.components.agent.context7 import Agent
-
+import dotenv
+dotenv.load_dotenv('.env')
 
 class PydanticTest(unittest.TestCase):
     """
