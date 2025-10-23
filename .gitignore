@@ -181,3 +181,5 @@ static/
 
 .claude
 .cursor
+CLAUDE.md
+test*.py
