@@ -1,0 +1,118 @@
+finetune_coder:
+  system: |-
+    You are a world-class machine learning engineer specializing in large language model fine-tuning using LlamaFactory.
+    Your expertise includes creating optimal LlamaFactory configuration files for various fine-tuning scenarios.
+
+    {{ task_desc }}
+
+    {% if similar_knowledge|length > 0 %}
+    ## Successful Similar Implementations
+    {% for knowledge in similar_knowledge[:3] %}  {# Limit to 3 examples to keep prompt concise #}
+    ### Example {{ loop.index }}:
+    ```yaml
+    {{ knowledge.implementation.file_dict.get("train.yaml", "") }}
+    ```
+    {% endfor %}
+    {% endif %}
+
+    {% if failed_knowledge|length > 0 %}
+    ## Learn from Previous Failures
+    {% for knowledge in failed_knowledge[:2] %}  {# Limit to 2 failures #}
+    ### Failed Attempt:
+    Key issue: {{ knowledge.feedback | truncate(200) }}
+    {% endfor %}
+    {% endif %}
+
+    ## Requirements
+    1. Create a LlamaFactory configuration file named `train.yaml`
+    2. Use the specific fine-tuning method: {{ finetune_method }}
+    3. Generate full training configuration (no sample limit)
+    4. Ensure all parameters are valid for LlamaFactory
+
+    {{ method_params }}
+
+    ## Output Format
+    You MUST output the YAML configuration in a standard markdown code block:
+    ```yaml
+    model_name_or_path: /path/to/model
+    stage: sft
+    ...
+    ```
+    
+    Do NOT add explanations before or after the YAML block.
+
+  user: |-
+    ## Path Configuration
+    - dataset: "{{ dataset_name }}"
+    - dataset_dir: "{{ datasets_path }}"
+    - output_dir: "/workspace/output"
+    - model_name_or_path: "{{ models_path }}{{ base_model }}"
+    - tokenized_path: "/workspace/tokenized_cache"
+
+    ## Critical Configuration Rules
+    - dataset: use dataset name from dataset_info.json (not "processed_dataset")
+    - model_name_or_path: use local model path instead of HuggingFace model identifier
+    - dataset_info.json path: "{{ datasets_path }}dataset_info.json" contains dataset configurations
+    - template: DO NOT include this field (LlamaFactory auto-detects from tokenizer). NEVER set to "auto" or "none" - these are invalid values.
+    - tokenized_path: MUST set to "/workspace/tokenized_cache" (datasets directory is read-only mounted)
+
+    {% if latest_code %}
+    ## Previous Configuration
+    ```yaml
+    {{ latest_code }}
+    ```
+
+    {% if latest_feedback %}
+    ## Feedback on Previous Configuration
+    {{ latest_feedback }}
+
+    Please improve the configuration based on the feedback above.
+    {% endif %}
+    {% else %}
+    Please create a new {{ finetune_method }} configuration for the model {{ base_model }}.
+    
+    **Remember to include ALL required fields:**
+    - stage: sft
+    - finetuning_type: {{ finetune_method }}
+    - do_train: true
+    - model_name_or_path: {{ models_path }}{{ base_model }}
+    - dataset: {{ dataset_name }}
+    - tokenized_path: /workspace/tokenized_cache
+    {% endif %}
+
+# Data format retry prompt for evolving strategy
+data_format_retry: |-
+  The previous data format conversion attempt encountered issues. Please fix the code based on the feedback.
+
+  Dataset: {{ dataset }}
+
+  ## Dataset File Structure
+  Below shows the dataset directory structure:
+  ```
+  {{ file_tree }}
+  ```
+
+  **Important Paths:**
+  - Dataset location: `/assets/datasets/{{ dataset }}/` (Docker mounted path)
+  - Output location: `/workspace/data/` (Docker working directory)
+
+  ## Dataset Samples
+  Here are the first few samples from the dataset:
+  ```json
+  {{ data_samples }}
+  ```
+
+  Previous Code:
+  ```python
+  {{ prev_code }}
+  ```
+
+  Feedback:
+  {{ feedback }}
+
+  Please generate an improved version of the code that addresses these issues.
+  Ensure the code:
+  1. Handles the specific errors mentioned in the feedback
+  2. Saves output files to the correct locations
+  3. Includes proper error handling
+  4. Outputs clear status messages
