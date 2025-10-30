@@ -79,7 +79,16 @@ class MultiProcessEvolvingStrategy(EvolvingStrategy):
         evolving_trace: list[EvoStep] = [],
         **kwargs,
     ) -> EvolvingItem:
+        if queried_knowledge is None:
+            raise ValueError(
+                "MultiProcessEvolvingStrategy requires queried_knowledge for efficient implementation. Please set with_knowledge=True in CoSTEER constructor."
+            )
         code_list = [None for _ in range(len(evo.sub_tasks))]
+
+        last_feedback = None
+        if len(evolving_trace) > 0:
+            last_feedback = evolving_trace[-1].feedback
+            assert isinstance(last_feedback, CoSTEERMultiFeedback)
 
         # 1.找出需要evolve的task
         to_be_finished_task_index: list[int] = []
@@ -91,17 +100,20 @@ class MultiProcessEvolvingStrategy(EvolvingStrategy):
                 code_list[index] = queried_knowledge.success_task_to_knowledge_dict[
                     target_task_desc
                 ].implementation.file_dict
-            elif (
-                target_task_desc not in queried_knowledge.success_task_to_knowledge_dict
-                and target_task_desc not in queried_knowledge.failed_task_info_set
-                and not (self.improve_mode and last_feedback[index] is None)
-            ):
-                to_be_finished_task_index.append(index)
-
-        last_feedback = None
-        if len(evolving_trace) > 0:
-            last_feedback = evolving_trace[-1].feedback
-            assert isinstance(last_feedback, CoSTEERMultiFeedback)
+            else:
+                # Schedule the task only if:
+                # - it is not marked failed
+                # - and (in improve mode) we actually have prior failure feedback to act on
+                skip_for_improve_mode = self.improve_mode and (
+                    last_feedback is None
+                    or (isinstance(last_feedback, CoSTEERMultiFeedback) and last_feedback[index] is None)
+                )
+                if target_task_desc not in queried_knowledge.failed_task_info_set and not skip_for_improve_mode:
+                    to_be_finished_task_index.append(index)
+                if skip_for_improve_mode:
+                    code_list[index] = (
+                        {}
+                    )  # empty implementation for skipped task, but assign_code_list_to_evo will still assign it
 
         result = multiprocessing_wrapper(
             [
