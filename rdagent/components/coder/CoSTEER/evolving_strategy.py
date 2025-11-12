@@ -79,6 +79,10 @@ class MultiProcessEvolvingStrategy(EvolvingStrategy):
         evolving_trace: list[EvoStep] = [],
         **kwargs,
     ) -> EvolvingItem:
+        if queried_knowledge is None:
+            raise ValueError(
+                "MultiProcessEvolvingStrategy requires queried_knowledge for efficient implementation. Please set with_knowledge=True in CoSTEER constructor."
+            )
         code_list = [None for _ in range(len(evo.sub_tasks))]
 
         last_feedback = None

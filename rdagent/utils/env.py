@@ -19,7 +19,9 @@ import time
 import uuid
 import zipfile
 from abc import abstractmethod
+from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Generator, Generic, Mapping, Optional, TypeVar, cast
@@ -32,9 +34,11 @@ from pydantic import BaseModel, model_validator
 from pydantic_settings import SettingsConfigDict
 from rich import print
 from rich.console import Console
+from rich.live import Live
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.rule import Rule
 from rich.table import Table
+from rich.text import Text
 from tqdm import tqdm
 
 from rdagent.core.conf import ExtendedBaseSettings
@@ -45,6 +49,30 @@ from rdagent.utils import filter_redundant_text
 from rdagent.utils.agent.tpl import T
 from rdagent.utils.fmt import shrink_text
 from rdagent.utils.workflow import wait_retry
+
+
+def extract_dir_name_from_path_config(path_str: str) -> str:
+    """
+    Extract the first directory component from a relative path string.
+
+    This is used to get the basename from path configurations like "./workspace_input/"
+    to use in chmod exclusion patterns.
+
+    Args:
+        path_str: A path string, typically from T() template configuration
+
+    Returns:
+        The first directory component, or empty string if not a relative path
+
+    Examples:
+        "./workspace_input/" -> "workspace_input"
+        "./assets/" -> "assets"
+        "/absolute/path" -> ""
+    """
+    p = Path(path_str)
+    if not p.is_absolute() and p.parts:
+        return p.parts[0]
+    return ""
 
 
 def cleanup_container(container: docker.models.containers.Container | None, context: str = "") -> None:  # type: ignore[no-any-unimported]
@@ -126,6 +154,7 @@ class EnvConf(ExtendedBaseSettings):
     enable_cache: bool = True
     retry_count: int = 5  # retry count for the docker run
     retry_wait_seconds: int = 10  # retry wait seconds for the docker run
+    exclude_chmod_paths: list[str] = []  # List of directory names to exclude from chmod operation
 
     model_config = SettingsConfigDict(
         # TODO: add prefix ....
@@ -174,7 +203,10 @@ class Env(Generic[ASpecificEnvConf]):
         with zipfile.ZipFile(zip_file_path, "w") as z:
             for root, _, files in os.walk(folder_path):
                 for file in files:
-                    z.write(os.path.join(root, file), os.path.relpath(os.path.join(root, file), folder_path))
+                    z.write(
+                        os.path.join(root, file),
+                        os.path.relpath(os.path.join(root, file), folder_path),
+                    )
 
     def unzip_a_file_into_a_folder(self, zip_file_path: str, folder_path: str) -> None:
         """
@@ -195,7 +227,11 @@ class Env(Generic[ASpecificEnvConf]):
         """
 
     def check_output(
-        self, entry: str | None = None, local_path: str = ".", env: dict | None = None, **kwargs: dict
+        self,
+        entry: str | None = None,
+        local_path: str = ".",
+        env: dict | None = None,
+        **kwargs: dict,
     ) -> str:
         """
         Run the folder under the environment.
@@ -291,23 +327,16 @@ class Env(Generic[ASpecificEnvConf]):
                 "the last command in the pipeline.",
             )
 
-        # FIXME: the input path and cache path is hard coded here.
-        # We don't want to change the content in input and cache path.
-        # Otherwise, it may produce large amount of warnings.
+        # Exclude configured directories from chmod operation to prevent modifying
+        # read-only or specially configured directories that may produce warnings.
         def _get_chmod_cmd(workspace_path: str) -> str:
-            def _get_path_stem(path: str) -> str | None:
-                # If the input path is relative, keep only the first component
-                p = Path(path)
-                if not p.is_absolute() and p.parts:
-                    return p.parts[0]
-                return None
-
             find_cmd = f"find {workspace_path} -mindepth 1 -maxdepth 1"
-            for name in [
-                _get_path_stem(T("scenarios.data_science.share:scen.cache_path").r()),
-                _get_path_stem(T("scenarios.data_science.share:scen.input_path").r()),
-            ]:
-                find_cmd += f" ! -name {name}"
+
+            # Use configurable exclude paths from DockerConf
+            for name in self.conf.exclude_chmod_paths:
+                if name:  # Skip empty names
+                    find_cmd += f" ! -name {name}"
+
             chmod_cmd = f"{find_cmd} -exec chmod -R 777 {{}} +"
             return chmod_cmd
 
@@ -372,7 +401,11 @@ class Env(Generic[ASpecificEnvConf]):
             json.dumps(
                 [
                     [str(path.relative_to(Path(local_path))), path.read_text()]
-                    for path in sorted(list(Path(local_path).rglob("*.py")) + list(Path(local_path).rglob("*.csv")))
+                    for path in sorted(
+                        list(Path(local_path).rglob("*.py"))
+                        + list(Path(local_path).rglob("*.csv"))
+                        + list(Path(local_path).rglob("*.yaml"))
+                    )
                 ]
             )
             + json.dumps({"entry": entry, "running_extra_volume": dict(running_extra_volume)})
@@ -521,7 +554,12 @@ class LocalEnv(Env[ASpecificLocalConf]):
             # Setup environment
             if env is None:
                 env = {}
-            path = [*self.conf.bin_path.split(":"), "/bin/", "/usr/bin/", *env.get("PATH", "").split(":")]
+            path = [
+                *self.conf.bin_path.split(":"),
+                "/bin/",
+                "/usr/bin/",
+                *env.get("PATH", "").split(":"),
+            ]
             env["PATH"] = ":".join(path)
 
             if entry is None:
@@ -643,6 +681,16 @@ class DockerConf(EnvConf):
     {<host_path>: {"bind": <container_path>, "mode": <mode, ro/rw/default is extra_volume_mode>}}
     """
     extra_volume_mode: str = "ro"  # by default. only the mount_path should be writable, others are changed to read-only
+
+    exclude_chmod_paths: list[str] = []
+    """List of directory names to exclude from chmod -R 777 operation.
+    This prevents modifying permissions of read-only or specially configured directories."""
+
+    # Declarative configuration for auto-populating exclude_chmod_paths from share.yaml
+    # Subclasses can override these to specify which config keys to read
+    _scenario_name: str | None = None  # e.g., "data_science", "finetune"
+    _exclude_path_keys: list[str] = []  # e.g., ["input_path", "cache_path"]
+
     # Sometime, we need maintain some extra data for the workspace.
     # And the extra data may be shared and the downloading can be time consuming.
     # So we just want to download it once.
@@ -658,6 +706,27 @@ class DockerConf(EnvConf):
 
     retry_count: int = 5  # retry count for the docker run
     retry_wait_seconds: int = 10  # retry wait seconds for the docker run
+
+    @model_validator(mode="after")
+    def populate_exclude_chmod_paths(self) -> "DockerConf":
+        """
+        Automatically populate exclude_chmod_paths from share.yaml configuration.
+
+        This method reads path configurations from scenarios/<scenario_name>/share.yaml
+        based on _scenario_name and _exclude_path_keys class attributes.
+        """
+        if not self.exclude_chmod_paths and self._scenario_name and self._exclude_path_keys:
+            # Extract directory names from scenario configuration
+            self.exclude_chmod_paths = [
+                name
+                for key in self._exclude_path_keys
+                if (
+                    name := extract_dir_name_from_path_config(
+                        T(f"scenarios.{self._scenario_name}.share:scen.{key}").r()
+                    )
+                )
+            ]
+        return self
 
 
 class QlibCondaConf(CondaConf):
@@ -706,7 +775,10 @@ class QlibDockerConf(DockerConf):
     mount_path: str = "/workspace/qlib_workspace/"
     default_entry: str = "qrun conf.yaml"
     extra_volumes: dict = {
-        str(Path("~/.qlib/").expanduser().resolve().absolute()): {"bind": "/root/.qlib/", "mode": "rw"}
+        str(Path("~/.qlib/").expanduser().resolve().absolute()): {
+            "bind": "/root/.qlib/",
+            "mode": "rw",
+        }
     }
     shm_size: str | None = "16g"
     enable_gpu: bool = True
@@ -747,6 +819,10 @@ class DSDockerConf(DockerConf):
         "48g"  # Add memory limit attribute # new-york-city-taxi-fare-prediction may need more memory
     )
 
+    # Declarative configuration: automatically loads from scenarios/data_science/share.yaml
+    _scenario_name: str = "data_science"
+    _exclude_path_keys: list[str] = ["input_path", "cache_path"]
+
 
 class MLEBDockerConf(DockerConf):
     model_config = SettingsConfigDict(env_prefix="MLEB_DOCKER_")
@@ -767,6 +843,54 @@ class MLEBDockerConf(DockerConf):
     enable_cache: bool = False
 
 
+class FTDockerConf(DockerConf):
+    model_config = SettingsConfigDict(env_prefix="FT_DOCKER_")
+
+    build_from_dockerfile: bool = True
+    dockerfile_folder_path: Path = (
+        Path(__file__).parent.parent / "scenarios" / "finetune" / "docker" / "llm_finetune_docker"
+    )
+    image: str = "local_llm_finetune:latest"
+    mount_path: str = "/workspace/"
+    default_entry: str = "llamafactory-cli version"
+
+    running_timeout_period: int | None = 36000  # 10 hours for training
+    mem_limit: str | None = "48g"  # Large memory for LLM training
+    shm_size: str | None = "16g"  # Shared memory for multi-GPU training
+    enable_gpu: bool = True  # Enable GPU for LLM training
+    enable_cache: bool = False  # Disable cache to avoid conflicts during training, True for debug
+
+    # Override log output control for FT training
+    save_logs_to_file: bool = True
+    terminal_tail_lines: int = 20
+
+    # Declarative configuration: automatically loads from scenarios/finetune/share.yaml
+    _scenario_name: str = "finetune"
+    _exclude_path_keys: list[str] = ["assets_path"]
+
+
+class BenchmarkDockerConf(DockerConf):
+    """Docker configuration for OpenCompass benchmark evaluation."""
+
+    model_config = SettingsConfigDict(env_prefix="BENCHMARK_DOCKER_")
+
+    build_from_dockerfile: bool = True
+    dockerfile_folder_path: Path = Path(__file__).parent.parent / "scenarios" / "finetune" / "docker" / "opencompass"
+    image: str = "rdagent-opencompass:latest"
+    mount_path: str = "/workspace/"
+    default_entry: str = "bash /app/opencompass_eval_entrypoint.sh"
+
+    running_timeout_period: int | None = 3600  # 1 hour default for benchmarks
+    mem_limit: str | None = "32g"  # Moderate memory for inference
+    shm_size: str | None = "8g"  # Shared memory for model loading
+    enable_gpu: bool = True  # Enable GPU for fast inference
+    enable_cache: bool = False  # Disable cache for reproducibility
+
+    # Benchmark-specific log settings
+    save_logs_to_file: bool = True
+    terminal_tail_lines: int = 50  # Show more lines for benchmark progress
+
+
 # physionet.org/files/mimic-eicu-fiddle-feature/1.0.0/FIDDLE_mimic3
 class DockerEnv(Env[DockerConf]):
     # TODO: Save the output into a specific file
@@ -783,7 +907,9 @@ class DockerEnv(Env[DockerConf]):
         ):
             logger.info(f"Building the image from dockerfile: {self.conf.dockerfile_folder_path}")
             resp_stream = client.api.build(
-                path=str(self.conf.dockerfile_folder_path), tag=self.conf.image, network_mode=self.conf.network
+                path=str(self.conf.dockerfile_folder_path),
+                tag=self.conf.image,
+                network_mode=self.conf.network,
             )
             if isinstance(resp_stream, str):
                 logger.info(resp_stream)
@@ -795,7 +921,10 @@ class DockerEnv(Env[DockerConf]):
                         if line.strip():
                             status_dict = json.loads(line)
                             if "error" in status_dict:
-                                p.update(task, description=f"[red]error: {status_dict['error']}")
+                                p.update(
+                                    task,
+                                    description=f"[red]error: {status_dict['error']}",
+                                )
                                 raise docker.errors.BuildError(status_dict["error"], "")
                             if "stream" in status_dict:
                                 p.update(task, description=status_dict["stream"])
@@ -812,7 +941,11 @@ class DockerEnv(Env[DockerConf]):
                 status_task = sp.add_task("[bright_magenta]layer status", progress="")
                 for line in image_pull:
                     if "error" in line:
-                        sp.update(status_task, description=f"[red]error", progress=line["error"])
+                        sp.update(
+                            status_task,
+                            description=f"[red]error",
+                            progress=line["error"],
+                        )
                         raise docker.errors.APIError(line["error"])
 
                     layer_id = line["id"]
@@ -828,7 +961,10 @@ class DockerEnv(Env[DockerConf]):
                     if status == "Pull complete" or status == "Already exists":
                         completed_layers += 1
 
-                    sp.update(main_task, progress=f"[green]{completed_layers}[white]/{len(layer_set)} layers completed")
+                    sp.update(
+                        main_task,
+                        progress=f"[green]{completed_layers}[white]/{len(layer_set)} layers completed",
+                    )
                     sp.update(
                         status_task,
                         description=f"[bright_magenta]layer {layer_id} [yellow]{status}",
@@ -870,6 +1006,129 @@ class DockerEnv(Env[DockerConf]):
 
         return _f()
 
+    def _generate_log_header(self, entry: str | None = None) -> str:
+        """
+        Generate a header for log files with execution info.
+
+        Args:
+            entry: Command entry that was executed
+
+        Returns:
+            Formatted header string
+        """
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        header = "=" * 80 + "\n"
+        header += f"Docker Execution Log\n"
+        header += f"Timestamp: {timestamp}\n"
+        header += f"Image: {self.conf.image}\n"
+        if entry:
+            header += f"Command: {entry}\n"
+        header += "=" * 80 + "\n\n"
+        return header
+
+    def _process_container_logs(self, logs, local_path: str = ".", entry: str | None = None) -> str:
+        """
+        Process Docker container logs with optional tail mode.
+
+        This method can be controlled via configuration:
+        - save_logs_to_file: Save full logs to timestamped files in logs/ subdirectory
+        - terminal_tail_lines: Show only last N lines in terminal (0 = show all)
+
+        Args:
+            logs: Docker container log stream
+            local_path: Path to workspace for saving log files
+            entry: Command entry that was executed (for logging header)
+
+        Returns:
+            Complete log output as string
+        """
+        log_output = ""
+
+        # Determine if we should use tail mode
+        use_tail_mode = self.conf.terminal_tail_lines > 0
+        save_to_file = self.conf.save_logs_to_file
+
+        # Set up log file with timestamp if needed
+        log_file_path = None
+        if save_to_file and local_path:
+            workspace = Path(local_path)
+
+            # Create logs subdirectory
+            logs_dir = workspace / "logs"
+            logs_dir.mkdir(parents=True, exist_ok=True)
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_file_path = logs_dir / f"docker_execution_{timestamp}.log"
+
+            # Write header with execution info
+            header = self._generate_log_header(entry)
+            with open(log_file_path, "w", encoding="utf-8") as f:
+                f.write(header)
+
+            # Also create/update a symlink to the latest log for convenience
+            latest_link = logs_dir / "docker_execution_latest.log"
+
+            print(f"[cyan]Full logs will be saved to: logs/{log_file_path.name}[/cyan]")
+
+        # Process logs with tail mode
+        if use_tail_mode:
+
+            log_buffer = deque(maxlen=self.conf.terminal_tail_lines)
+
+            def format_tail_display():
+                text = Text()
+                text.append(
+                    f"[Showing last {len(log_buffer)}/{self.conf.terminal_tail_lines} lines",
+                    style="dim",
+                )
+                if log_file_path:
+                    text.append(f" | Full log: {log_file_path.name}]\n", style="dim cyan")
+                else:
+                    text.append("]\n", style="dim")
+                text.append("-" * 80 + "\n", style="dim")
+                for line in log_buffer:
+                    text.append(line + "\n")
+                return text
+
+            with Live(format_tail_display(), refresh_per_second=2, console=Console()) as live:
+                for log in logs:
+                    decoded_log = log.strip().decode()
+                    log_output += decoded_log + "\n"
+                    log_buffer.append(decoded_log)
+
+                    if log_file_path:
+                        with open(log_file_path, "a", encoding="utf-8") as f:
+                            f.write(decoded_log + "\n")
+
+                    live.update(format_tail_display())
+        else:
+            # Default behavior: show all logs
+            for log in logs:
+                decoded_log = log.strip().decode()
+                Console().print(decoded_log, markup=False)
+                log_output += decoded_log + "\n"
+
+                if log_file_path:
+                    with open(log_file_path, "a", encoding="utf-8") as f:
+                        f.write(decoded_log + "\n")
+
+        # Show log file location and create latest symlink
+        if log_file_path and log_file_path.exists():
+            print(f"[green]Full execution log saved to: {log_file_path.absolute()}[/green]")
+
+            # Create or update symlink to latest log
+            latest_link = log_file_path.parent / "docker_execution_latest.log"
+            if latest_link.exists() or latest_link.is_symlink():
+                latest_link.unlink()
+            try:
+                latest_link.symlink_to(log_file_path.name)
+                print(f"[dim]Latest log symlink: logs/{latest_link.name} -> {log_file_path.name}[/dim]")
+            except Exception:
+                # Symlinks might not work on all systems (e.g., Windows without admin)
+                pass
+
+        return log_output
+
     def _run(
         self,
         entry: str | None = None,
@@ -883,6 +1142,7 @@ class DockerEnv(Env[DockerConf]):
         env["PYTHONWARNINGS"] = "ignore"
         env["TF_CPP_MIN_LOG_LEVEL"] = "2"
         env["PYTHONUNBUFFERED"] = "1"
+        env["TOKENIZERS_PARALLELISM"] = "false"  # Avoid tokenizer fork warning in multi-process training
         client = docker.from_env()
 
         volumes = {}
@@ -895,7 +1155,10 @@ class DockerEnv(Env[DockerConf]):
                 volumes[lp] = rp if isinstance(rp, dict) else {"bind": rp, "mode": self.conf.extra_volume_mode}
             cache_path = "/tmp/sample" if "/sample/" in "".join(self.conf.extra_volumes.keys()) else "/tmp/full"
             Path(cache_path).mkdir(parents=True, exist_ok=True)
-            volumes[cache_path] = {"bind": T("scenarios.data_science.share:scen.cache_path").r(), "mode": "rw"}
+            volumes[cache_path] = {
+                "bind": T("scenarios.data_science.share:scen.cache_path").r(),
+                "mode": "rw",
+            }
         for lp, rp in running_extra_volume.items():
             volumes[lp] = rp if isinstance(rp, dict) else {"bind": rp, "mode": self.conf.extra_volume_mode}
 
@@ -932,10 +1195,10 @@ class DockerEnv(Env[DockerConf]):
             table.add_row("Env", "\n".join(f"{k}:{v}" for k, v in env.items()))
             table.add_row("Volumes", "\n".join(f"{k}:\n  {v}" for k, v in volumes.items()))
             print(table)
-            for log in logs:
-                decoded_log = log.strip().decode()
-                Console().print(decoded_log, markup=False)
-                log_output += decoded_log + "\n"
+
+            # Process logs (supports tail mode if configured)
+            log_output = self._process_container_logs(logs, local_path, entry=entry)
+
             exit_status = container.wait()["StatusCode"]
             print(Rule("[bold green]Docker Logs End[/bold green]", style="dark_orange"))
             return log_output, exit_status
@@ -980,4 +1243,39 @@ class MLEBDockerEnv(DockerEnv):
     """MLEBench Docker"""
 
     def __init__(self, conf: DockerConf = MLEBDockerConf()):
+        super().__init__(conf)
+
+
+class FTDockerEnv(DockerEnv):
+    """
+    LLM Fine-tuning Docker Environment with improved log output control.
+
+    FTDockerConf enables:
+    - save_logs_to_file: True (saves full logs to workspace/docker_execution.log)
+    - terminal_tail_lines: 20 (only shows last 20 lines in terminal)
+
+    To customize, set environment variables:
+        export FT_DOCKER_terminal_tail_lines=50  # show last 50 lines
+        export FT_DOCKER_save_logs_to_file=false # disable log file
+    """
+
+    def __init__(self, conf: DockerConf = FTDockerConf()):
+        super().__init__(conf)
+
+
+class BenchmarkDockerEnv(DockerEnv):
+    """
+    OpenCompass Benchmark Docker Environment.
+
+    Uses BenchmarkDockerConf for evaluation-specific settings:
+    - Moderate memory/GPU allocation for inference
+    - Longer terminal output (50 lines) to track benchmark progress
+    - Automatic Dockerfile building from scenarios/finetune/docker/opencompass
+
+    To customize, set environment variables:
+        export BENCHMARK_DOCKER_running_timeout_period=7200  # 2 hours
+        export BENCHMARK_DOCKER_terminal_tail_lines=100  # show last 100 lines
+    """
+
+    def __init__(self, conf: DockerConf = BenchmarkDockerConf()):
         super().__init__(conf)

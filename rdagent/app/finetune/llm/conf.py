@@ -1,43 +1,90 @@
-import os
+from pathlib import Path
 
 from pydantic_settings import SettingsConfigDict
 
-from rdagent.app.data_science.conf import DS_RD_SETTING
-from rdagent.core.conf import RD_AGENT_SETTINGS, ExtendedBaseSettings
+from rdagent.core.conf import ExtendedBaseSettings
 
 
-class LLMFinetuneScen(ExtendedBaseSettings):
+class LLMFinetunePropSetting(ExtendedBaseSettings):
+    """LLM Fine-tune dedicated property settings.
+
+    - Adjust timeouts and template
+    - Use FT_ env prefix for overrides
+    """
+
     model_config = SettingsConfigDict(env_prefix="FT_", protected_namespaces=())
-    scen: str = "rdagent.app.finetune.llm.scen.LLMFinetuneScen"
-    """
-    Scenario class for data science tasks.
-    - For Kaggle competitions, use: "rdagent.scenarios.data_science.scen.KaggleScen"
-    - For custom data science scenarios, use: "rdagent.scenarios.data_science.scen.DataScienceScen"
-    - For LLM finetune scenarios, use: "rdagent.app.finetune.llm.scen.LLMFinetuneScen"
-    - For Data science finetune scenarios, use: "rdagent.app.finetune.data_science.scen.DSFinetuneScen"
+
+    # Main Components
+    scen: str = "rdagent.scenarios.finetune.scen.scenario.LLMFinetuneScen"
+    """Scenario class for LLM fine-tuning tasks."""
+
+    hypothesis_gen: str = "rdagent.scenarios.finetune.proposal.proposal.LLMFinetuneExpGen"
+    """Hypothesis generation class for LLM fine-tuning tasks."""
+
+    coder: str = "rdagent.components.coder.finetune.LLMFinetuneCoSTEER"
+    """Code generator.
+    Function: Generate LLM fine-tuning code based on experiment design.
     """
 
-    hypothesis_gen: str = "rdagent.app.finetune.llm.proposal.FinetuneExpGen"
-    """Hypothesis generation class"""
+    runner: str = "rdagent.scenarios.finetune.train.runner.LLMFinetuneRunner"  # TODO
+    """Code runner.
+    Function: Execute LLM fine-tuning code in a Docker environment.
+    """
 
+    summarizer: str = "rdagent.scenarios.finetune.dev.feedback.FTExperiment2Feedback"
+    """Result summarizer - To be implemented.
+    Function: Analyze fine-tuning results and generate feedback, including performance metrics and error analysis.
+    """
+
+    # Timeouts (longer for LLM training)
     debug_timeout: int = 36000
-    """The timeout limit for running on debugging data"""
     full_timeout: int = 360000
-    """The timeout limit for running on full data"""
 
+    # Pipeline behavior
     coder_on_whole_pipeline: bool = True
-    enable_model_dump: bool = True
-    app_tpl: str = "app/finetune/llm/tpl"
+    app_tpl: str = "scenarios/finetune"
+
+    # Benchmark evaluation (always enabled as part of evaluation pipeline)
+    benchmark_datasets: list[str] = ["aime25"]
+    """Benchmark datasets to evaluate on. Supported: aime25, aime24, mmlu, gsm8k, math, etc.
+    Will be mapped to OpenCompass dataset names (e.g., aime25 -> aime2025_llmjudge_gen_5e9f4f)"""
+
+    benchmark_timeout: int = 3600
+    """Benchmark evaluation timeout in seconds"""
+
+    # Judge API configuration (for llmjudge benchmarks like AIME)
+    judge_model: str = "gpt-5"
+    """LLM judge model name for evaluation"""
+
+    judge_api_key: str | None = None
+    """API key for judge model (if None, will try to use from environment)"""
+
+    judge_api_base: str | None = None
+    """API base URL for judge model (if None, will use default)"""
+
+    benchmark_limit: int | None = None
+    """Limit number of samples for benchmark evaluation (None for full evaluation). Use for quick testing and debugging."""
+
+    # Data paths and processing
+    file_path: Path = Path.cwd() / "git_ignore_folder" / "finetune_files"
+    show_nan_columns: bool = False
+    sample_data_by_LLM: bool = True
+
+    # LLM-specific fields
+    user_target_scenario: str | None = None
+    base_model: str | None = None
+    dataset: str | None = None
+
+    # LLaMA Factory
+    update_llama_factory: bool = True
+
+    # Docker settings
+    docker_enable_cache: bool = False
+    """Enable Docker cache for training (set via FT_DOCKER_ENABLE_CACHE)"""
+
+    # data sample count
+    data_sample_count: int = 3
 
 
-def update_settings(competition: str):
-    """
-    Update the RD_AGENT_SETTINGS with the values from LLM_FINETUNE_SETTINGS.
-    """
-    LLM_FINETUNE_SETTINGS = LLMFinetuneScen()
-    RD_AGENT_SETTINGS.app_tpl = LLM_FINETUNE_SETTINGS.app_tpl
-    os.environ["DS_CODER_COSTEER_EXTRA_EVALUATOR"] = '["rdagent.app.finetune.share.eval.PrevModelLoadEvaluator"]'
-    for field_name, new_value in LLM_FINETUNE_SETTINGS.model_dump().items():
-        if hasattr(DS_RD_SETTING, field_name):
-            setattr(DS_RD_SETTING, field_name, new_value)
-    DS_RD_SETTING.competition = competition
+# Global setting instance for LLM finetuning scenario
+FT_RD_SETTING = LLMFinetunePropSetting()

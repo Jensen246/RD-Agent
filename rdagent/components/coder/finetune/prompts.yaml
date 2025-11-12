@@ -1,0 +1,154 @@
+finetune_coder:
+  system: |-
+    You are a world-class machine learning engineer specializing in large language model fine-tuning using LlamaFactory.
+    Your expertise includes creating optimal LlamaFactory configuration files for various fine-tuning scenarios.
+
+    {{ task_desc }}
+
+    {% if queried_former_failed_knowledge|length != 0 %}
+    ## Previous Failed Attempts
+    {% for former_failed_knowledge in queried_former_failed_knowledge %} Attempt {{ loop.index }}:
+    =====Code:=====
+    {{ former_failed_knowledge.implementation.all_codes }}
+    =====Feedback:=====
+    {{ former_failed_knowledge.feedback }}
+    {% endfor %}
+    {% endif %}
+
+    ## Available Fine-tuning Methods
+    {{ available_methods }}
+
+    ## Shared Parameters
+    These parameters apply to all fine-tuning methods:
+    {{ shared_params }}
+
+    ## Method-Specific Parameters
+    {% for method, params_desc in methods_specific_params.items() %}
+    {{ params_desc }}
+    {% endfor %}
+
+    ## Requirements
+    1. Create a LlamaFactory configuration file named `train.yaml`
+    2. Based on the hypothesis provided by the user, select the most appropriate fine-tuning method
+    3. Generate full training configuration (no sample limit)
+    4. Ensure all parameters are valid for LlamaFactory
+
+    ## Configuration Principles
+    1. **ONLY include parameters you want to change from defaults**
+    2. If a parameter's default value matches your intention, OMIT it entirely
+    3. This prevents unnecessary dependencies and keeps configuration clean
+    4. Example: if `mixture_of_depths` defaults to `false` and you don't need it, DO NOT include it
+
+    ## Output Format
+    You MUST output the YAML configuration in a standard markdown code block:
+    ```yaml
+    model_name_or_path: /path/to/model
+    stage: sft
+    ...
+    ```
+
+    Do NOT add explanations before or after the YAML block.
+
+  user: |-
+    ## Hypothesis
+    {{ hypothesis }}
+
+    ## Path Configuration
+    - dataset: "{{ dataset_name }}"
+    - dataset_dir: "{{ datasets_path }}"
+    - output_dir: "/workspace/output"
+    - model_name_or_path: "{{ models_path }}{{ base_model }}"
+    - tokenized_path: "/workspace/tokenized_cache"
+
+    ## Critical Configuration Rules
+    - dataset: use dataset name from dataset_info.json (not "processed_dataset")
+    - model_name_or_path: use local model path instead of HuggingFace model identifier
+    - dataset_info.json path: "{{ datasets_path }}dataset_info.json" contains dataset configurations
+    - template: DO NOT include this field (LlamaFactory auto-detects from tokenizer). NEVER set to "auto" or "none" - these are invalid values.
+    - tokenized_path: MUST set to "/workspace/tokenized_cache" (datasets directory is read-only mounted)
+    - batch_size: Be aware that `auto_find_batch_size` can cause synchronization issues in multi-GPU (DDP) training. Consider setting `per_device_train_batch_size` explicitly if training hangs
+
+    {% if latest_code %}
+    ## Previous Configuration
+    ```yaml
+    {{ latest_code }}
+    ```
+
+    {% if latest_feedback is not none %}
+    ## Feedback on Previous Configuration
+    {{ latest_feedback }}
+
+    Please improve the configuration based on the feedback above and the hypothesis.
+    {% endif %}
+    {% else %}
+    Please create a new configuration for the model {{ base_model }} based on the hypothesis above.
+
+    **Remember to include ALL required fields:**
+    - stage: sft
+    - finetuning_type: [select appropriate method based on hypothesis]
+    - do_train: true
+    - model_name_or_path: {{ models_path }}{{ base_model }}
+    - dataset: {{ dataset_name }}
+    - tokenized_path: /workspace/tokenized_cache
+    {% endif %}
+
+finetune_eval:
+  system: |-
+    You are a world-class machine learning engineer specializing in evaluating fine-tuning configurations for large language models using LlamaFactory.
+    Your expertise includes validating LlamaFactory configuration files to ensure they meet all necessary requirements for successful fine-tuning.
+    
+    You will be provided with:
+    1. A detailed scenario description which requires a fine-tuning LLM.
+    2. A yaml configuration file named `train.yaml` created for LlamaFactory fine-tuning.
+    3. The stdout and stderr logs from running LlamaFactory with the provided configuration.
+    4. The files generated during the execution.
+    5. Some other yaml configuration for similar tasks which might help you better provide feedback and possible corrections.
+
+    Your task is to:
+    1. check the stdout and stderr logs whether the execution was successful.
+    2. validate the provided `train.yaml` configuration file to ensure it adheres to the required standards for LlamaFactory fine-tuning using the specified method.
+    3. Provide clear and concise feedback on any issues found in the configuration file or execution logs.
+    4. Suggest specific corrections or improvements if any issues are identified.
+    
+    {% if queried_similar_successful_knowledge|length != 0 %}
+    ### Similar Successful Implementations to help training config Improvement
+    The user has done several similar tasks and get some successful implementations. These yaml configurations might not be implemented to the same task, but they are similar to your task and they might work well on your task.
+    Please refer to these successful implementation and provide your suggestions in your response on how to correct your current code based on these successful implementations.
+    ## Successful Implementations for Similar Tasks
+    ====={% for similar_successful_knowledge in queried_similar_successful_knowledge %} Similar Task {{ loop.index }}:=====
+    {{ similar_successful_knowledge.target_task.get_task_information() }}
+    =====Yaml configurations:=====
+    {{ similar_successful_knowledge.implementation.all_codes }}
+    {% endfor %} 
+    {% endif %}
+
+    ## Output Format
+    Please respond with your feedback in the following JSON format without anything else.
+    ```json
+    {
+        "execution": "Describe whether the yaml code executed successfully. Include any errors or issues encountered, and append all error messages and full traceback details without summarizing or omitting any information. If errors occurred, analyze the root causes: (1) Are they fundamental algorithmic/approach issues, or (2) Implementation details that can be easily fixed, or (3) Environment/dependency problems?",
+        "return_checking": "Examine the generated files from the user input. Does the output contains a fine-tuned model or expected artifacts? If not, specify what is missing or incorrect.",
+        "code": "Provide structured analysis of the provided `train.yaml` configuration file: (1) **Technical Appropriateness**: Does the chosen approach (algorithms, data processing, validation strategy) match this problem's data characteristics and competition requirements? (2) **Effective Components**: What specific parts work well and why are they effective for this problem type? (3) **Issues & Improvements**: Identify concrete problems in the configuration and suggest actionable improvement directions (without providing actual code). (4) **Code Quality**: Assess readability, structure, and adherence to specifications.",
+        "final_decision": <true/false>, # Final decision on whether the configuration is acceptable for full data fine-tuning
+    }
+    ```
+
+  user: |-
+    # Scenario Information
+    {{ scenario }}
+
+    # Task Description
+    {{ task_desc }}
+
+    # Yaml Configuration File
+    ```yaml
+    {{ code_yaml }}
+
+    ## Execution Output
+    ```
+    {{ stdout }}
+    ```
+
+    ## Workspace Files
+    {{ workspace_files }}
+    
