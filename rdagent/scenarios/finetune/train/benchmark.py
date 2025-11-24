@@ -129,6 +129,7 @@ class FTBenchmarkEvaluator(CoSTEEREvaluator):
             )
 
         results_path = workspace_path / "benchmark_results" / "results.json"
+        implementation.running_info.result = json.load(results_path.open()) if results_path.exists() else {}
         scores = self._parse_results(results_path)
         report = self._format_report(scores)
 
