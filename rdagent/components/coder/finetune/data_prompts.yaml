@@ -1,0 +1,344 @@
+# Data Processing Coder Prompts
+# Used for generating main.py data processing scripts (COT-Self-Instruct pipeline)
+
+data_coder:
+  system: |-
+    You are a world-class machine learning engineer specializing in LLM data processing and synthesis.
+    Your task is to create a COT-Self-Instruct data processing pipeline for generating high-quality SFT datasets.
+
+    # Scenario Description
+    {{ scenario }}
+
+    # Task Description
+    {{ task_desc }}
+
+    {% if queried_former_failed_knowledge|length != 0 %}
+    ## Previous Failed Attempts
+    {% for former_failed_knowledge in queried_former_failed_knowledge %}
+    Attempt {{ loop.index }}:
+    =====Code:=====
+    {{ former_failed_knowledge.implementation.all_codes }}
+    =====Feedback:=====
+    {{ former_failed_knowledge.feedback }}
+    {% endfor %}
+    {% endif %}
+
+    ## COT-Self-Instruct Pipeline (You MUST implement this)
+
+    ### Pipeline Steps:
+    1. **Load seed data**: Read input JSONL file containing seed questions/problems
+    2. **Filter unverifiable samples**: Remove samples that cannot be objectively verified
+       - Filter out: proof questions (mathematical proofs), subjective questions (opinions)
+       - Keep only: questions with standard/verifiable answers (math with numerical answers, factual QA)
+    3. **Generate with COT**: Use the model to generate prompt + chain-of-thought reasoning + answer
+       - Each response MUST include step-by-step reasoning process
+       - Format: "Let me think step by step... [reasoning]... Therefore, the answer is [answer]"
+    4. **Majority vote validation**: Sample N times (e.g., 16x) for each question
+       - Extract final answers from each sample
+       - If majority agrees (>50% same answer) → sample is valid
+       - If answers diverge → discard or flag for regeneration
+    5. **Best response regeneration**: Use model to regenerate final high-quality response
+       - NOT selecting from the 16+ existing responses
+       - Generate NEW response with best reasoning quality
+    6. **Output**: alpaca format JSONL with fields: instruction, input (optional), output
+
+    ## Requirements
+    1. Create a complete Python script named `main.py`
+    2. The script MUST use RD-Agent's internal APIBackend for model calls
+    3. The script MUST support checkpoint/resume for long-running processes
+    4. The script MUST support debug mode with limited samples
+    5. Output format: alpaca format JSONL ({"instruction": "...", "input": "", "output": "..."})
+
+    ## Script Structure Requirements
+    The generated main.py MUST follow this structure:
+
+    ```python
+    """
+    COT-Self-Instruct Data Processing Pipeline
+
+    Steps:
+    1. Load seed data
+    2. Filter unverifiable samples
+    3. Generate with COT (chain-of-thought reasoning)
+    4. Majority vote validation (N samples, check consistency)
+    5. Best response regeneration
+    6. Output alpaca format JSONL
+    """
+    import argparse
+    import json
+    import re
+    from pathlib import Path
+    from collections import Counter
+    from rdagent.oai.llm_utils import APIBackend
+
+    # ========== Configuration ==========
+    NUM_SAMPLES = 16  # Number of samples for majority voting
+    MAJORITY_THRESHOLD = 0.5  # Minimum agreement ratio
+
+    # ========== Checkpoint Support ==========
+    def load_checkpoint(checkpoint_path: str) -> dict:
+        """Load checkpoint for resuming"""
+        if Path(checkpoint_path).exists():
+            with open(checkpoint_path, "r") as f:
+                return json.load(f)
+        return {"processed_ids": [], "last_index": 0}
+
+    def save_checkpoint(checkpoint_path: str, state: dict):
+        """Save checkpoint for resuming"""
+        with open(checkpoint_path, "w") as f:
+            json.dump(state, f)
+
+    # ========== Data Processing Functions ==========
+    def load_dataset(path: str) -> list[dict]:
+        """Load seed dataset from JSONL file"""
+        data = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    data.append(json.loads(line))
+        return data
+
+    def is_verifiable(item: dict) -> bool:
+        """Check if a sample has a verifiable answer"""
+        # Filter out proof questions, subjective questions
+        # Keep questions with numerical/factual answers
+        question = item.get("instruction", "") + item.get("input", "")
+        # Add your filtering logic here
+        ...
+
+    def filter_unverifiable(data: list[dict]) -> list[dict]:
+        """Filter out samples with unverifiable answers"""
+        return [item for item in data if is_verifiable(item)]
+
+    def extract_final_answer(response: str) -> str:
+        """Extract final answer from COT response"""
+        # Look for patterns like "the answer is X", "Therefore, X", etc.
+        ...
+
+    def generate_cot_response(item: dict, api_backend: APIBackend) -> str:
+        """Generate a single COT response"""
+        prompt = f"Question: {item['instruction']}\n\nPlease solve this step by step, showing your reasoning process."
+        response = api_backend.build_messages_and_create_chat_completion(
+            user_prompt=prompt,
+            system_prompt="You are a helpful assistant. Solve problems step by step.",
+        )
+        return response
+
+    def majority_vote_validate(item: dict, api_backend: APIBackend) -> tuple[bool, list[str]]:
+        """Generate N samples and check majority agreement"""
+        responses = []
+        answers = []
+
+        for _ in range(NUM_SAMPLES):
+            resp = generate_cot_response(item, api_backend)
+            responses.append(resp)
+            answers.append(extract_final_answer(resp))
+
+        # Check majority agreement
+        answer_counts = Counter(answers)
+        most_common, count = answer_counts.most_common(1)[0]
+        agreement_ratio = count / len(answers)
+
+        return agreement_ratio >= MAJORITY_THRESHOLD, responses
+
+    def regenerate_best_response(item: dict, api_backend: APIBackend) -> str:
+        """Regenerate final high-quality response"""
+        prompt = f"Question: {item['instruction']}\n\nProvide a detailed, step-by-step solution with clear reasoning."
+        response = api_backend.build_messages_and_create_chat_completion(
+            user_prompt=prompt,
+            system_prompt="You are an expert. Provide detailed, accurate answers with step-by-step reasoning.",
+        )
+        return response
+
+    def process_item(item: dict, api_backend: APIBackend) -> dict | None:
+        """Process a single data item through COT-Self-Instruct pipeline"""
+        # Step 1: Majority vote validation
+        is_valid, responses = majority_vote_validate(item, api_backend)
+
+        if not is_valid:
+            print(f"  Skipped: answers diverged, not consistent enough")
+            return None
+
+        # Step 2: Regenerate best response
+        best_response = regenerate_best_response(item, api_backend)
+
+        # Step 3: Format as alpaca
+        return {
+            "instruction": item["instruction"],
+            "input": item.get("input", ""),
+            "output": best_response
+        }
+
+    def save_sft_dataset(data: list[dict], output_path: str):
+        """Save as alpaca format JSONL"""
+        with open(output_path, "w", encoding="utf-8") as f:
+            for item in data:
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+    def main():
+        parser = argparse.ArgumentParser(description="COT-Self-Instruct Data Processing")
+        parser.add_argument("--input", required=True, help="Input dataset path")
+        parser.add_argument("--output", required=True, help="Output SFT dataset path")
+        parser.add_argument("--checkpoint", default="checkpoint.json", help="Checkpoint file path")
+        parser.add_argument("--debug", action="store_true", help="Debug mode with limited samples")
+        parser.add_argument("--max_samples", type=int, default=5, help="Max samples in debug mode")
+        args = parser.parse_args()
+
+        # Initialize APIBackend
+        api_backend = APIBackend()
+
+        # Load checkpoint
+        checkpoint = load_checkpoint(args.checkpoint)
+        processed_ids = set(checkpoint["processed_ids"])
+
+        # Load and filter data
+        print("Loading dataset...")
+        data = load_dataset(args.input)
+        print(f"Loaded {len(data)} samples")
+
+        print("Filtering unverifiable samples...")
+        data = filter_unverifiable(data)
+        print(f"After filtering: {len(data)} samples")
+
+        if args.debug:
+            data = data[:args.max_samples]
+            print(f"Debug mode: processing {len(data)} samples")
+
+        # Process with checkpoint support
+        results = []
+        for i, item in enumerate(data):
+            item_id = item.get("id", str(i))
+            if item_id in processed_ids:
+                continue
+
+            try:
+                print(f"Processing {i+1}/{len(data)}: {item_id}")
+                processed = process_item(item, api_backend)
+                if processed:
+                    results.append(processed)
+
+                # Update checkpoint
+                processed_ids.add(item_id)
+                save_checkpoint(args.checkpoint, {
+                    "processed_ids": list(processed_ids),
+                    "last_index": i
+                })
+            except Exception as e:
+                print(f"Error processing {item_id}: {e}")
+                continue
+
+        # Save output
+        save_sft_dataset(results, args.output)
+        print(f"Saved {len(results)} samples to {args.output}")
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    ## Output Format
+    You MUST output the complete Python script in a markdown code block:
+    ```python
+    # Your complete main.py implementation
+    ...
+    ```
+
+    Do NOT add explanations before or after the code block.
+    The script must be complete and runnable.
+
+  user: |-
+    ## Configuration
+    - Input dataset path: provided via --input argument
+    - Output path: provided via --output argument
+    - Base model for generation: {{ base_model }}
+    - APIBackend: uses environment configuration (no command line argument needed)
+
+    ## Dataset Information
+    {{ dataset_info }}
+
+    {% if latest_code %}
+    ## Previous Implementation
+    ```python
+    {{ latest_code }}
+    ```
+
+    {% if latest_feedback is not none %}
+    ## Feedback on Previous Implementation
+    {{ latest_feedback }}
+
+    Please improve the implementation based on the feedback above.
+    {% endif %}
+    {% else %}
+    Please create a new data processing script based on the task description above.
+
+    **Remember the key requirements:**
+    1. Use APIBackend from rdagent.oai.llm_utils for model calls
+    2. Implement checkpoint/resume support
+    3. Support --debug mode with --max_samples
+    4. Output alpaca format JSONL
+    5. Handle errors gracefully and continue processing
+    {% endif %}
+
+# Data Processing Evaluation Prompts
+data_eval:
+  system: |-
+    You are a world-class machine learning engineer specializing in evaluating data processing pipelines.
+    Your expertise includes validating Python scripts for LLM data synthesis tasks.
+
+    You will be provided with:
+    1. A scenario description for the data processing task
+    2. A Python script (main.py) created for data processing
+    3. The stdout and stderr logs from running the script in debug mode
+    4. The output files generated during execution
+
+    Your task is to:
+    1. Check if the script executed successfully in debug mode
+    2. Validate that the output format is correct (alpaca format JSONL)
+    3. Check if checkpoint/resume functionality is implemented
+    4. Verify error handling is in place
+    5. Provide feedback on any issues found
+
+    {% if queried_similar_successful_knowledge|length != 0 %}
+    ### Similar Successful Implementations
+    {% for similar_successful_knowledge in queried_similar_successful_knowledge %}
+    Similar Task {{ loop.index }}:
+    {{ similar_successful_knowledge.target_task.get_task_information() }}
+    =====Code:=====
+    {{ similar_successful_knowledge.implementation.all_codes }}
+    {% endfor %}
+    {% endif %}
+
+    # Important Notice
+    - Debug mode runs with limited samples (typically 5), so the output will be small
+    - Focus on: script runs without errors, output format is correct, checkpoint works
+    - If errors occurred, analyze root cause and suggest fixes
+
+    ## Output Format
+    Please respond with your feedback in JSON format:
+    ```json
+    {
+        "execution": "Plain text. Describe whether the script executed successfully. Include any errors encountered with full traceback.",
+        "return_checking": "Plain text. Check the output file: Does it exist? Is it valid JSONL? Does each line have 'instruction', 'input', 'output' fields?",
+        "code": "Plain text. Analyze the code: (1) Is checkpoint/resume implemented correctly? (2) Is error handling adequate? (3) Is the processing logic correct for the specified method? (4) Any improvements needed?",
+        "final_decision": <true/false>
+    }
+    ```
+
+  user: |-
+    # Scenario Information
+    {{ scenario }}
+
+    # Task Description
+    {{ task_desc }}
+
+    # Python Script (main.py)
+    ```python
+    {{ code_python }}
+    ```
+
+    ## Execution Output
+    ```
+    {{ stdout }}
+    ```
+
+    ## Output Files
+    {{ output_files }}

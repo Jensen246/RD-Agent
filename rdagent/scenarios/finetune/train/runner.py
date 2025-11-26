@@ -18,6 +18,7 @@ from rdagent.components.coder.CoSTEER.knowledge_management import (
     CoSTEERQueriedKnowledge,
 )
 from rdagent.components.coder.finetune.conf import (
+    DATA_MAIN_FILE_NAME,
     FT_YAML_FILE_NAME,
     FTCoderCoSTEERSettings,
 )
@@ -48,13 +49,27 @@ class FTRunnerEvolvingStrategy(MultiProcessEvolvingStrategy):
         workspace: FBWorkspace | None = None,
         prev_task_feedback: CoSTEERSingleFeedback | None = None,
     ) -> dict[str, str]:
-        """No modification needed - directly use coder's full training config."""
-        # TODO: detect error during training automatically, and fix it here
-        if not workspace or FT_YAML_FILE_NAME not in workspace.file_dict:
-            logger.error(f"No {FT_YAML_FILE_NAME} found in workspace")
-            return {}
+        """No modification needed - directly use coder's generated files.
 
-        # Coder already generated full training config, no modification needed
+        Supports two task types:
+        - "train": Uses train.yaml for LlamaFactory training
+        - "data": Uses main.py for data processing pipeline
+        """
+        # Determine task type
+        task_type = getattr(target_task, "task_type", "train")
+
+        if task_type == "data":
+            # Check for main.py
+            if not workspace or DATA_MAIN_FILE_NAME not in workspace.file_dict:
+                logger.error(f"No {DATA_MAIN_FILE_NAME} found in workspace")
+                return {}
+        else:
+            # Check for train.yaml
+            if not workspace or FT_YAML_FILE_NAME not in workspace.file_dict:
+                logger.error(f"No {FT_YAML_FILE_NAME} found in workspace")
+                return {}
+
+        # Coder already generated the files, no modification needed
         # Return empty dict to indicate no changes
         return {}
 

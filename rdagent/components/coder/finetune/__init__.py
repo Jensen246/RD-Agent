@@ -23,6 +23,7 @@ from rdagent.components.coder.CoSTEER.knowledge_management import (
     CoSTEERQueriedKnowledge,
 )
 from rdagent.components.coder.finetune.conf import (
+    DATA_MAIN_FILE_NAME,
     FT_YAML_FILE_NAME,
     FTCoderCoSTEERSettings,
 )
@@ -56,9 +57,17 @@ class LLMFinetuneEvolvingStrategy(MultiProcessEvolvingStrategy):
         workspace: FBWorkspace | None = None,
         prev_task_feedback: CoSTEERSingleFeedback | None = None,
     ) -> dict[str, str]:
-        """Implement a single fine-tuning task by generating LlamaFactory config"""
+        """Implement a single fine-tuning task.
 
+        Supports two task types:
+        - "train": Generate train.yaml for LlamaFactory training
+        - "data": Generate main.py for data processing pipeline
+        """
         task_info = target_task.get_task_information()
+        task_type = getattr(target_task, "task_type", "train")
+
+        # Determine which file to check for previous failed knowledge
+        target_file = DATA_MAIN_FILE_NAME if task_type == "data" else FT_YAML_FILE_NAME
 
         queried_former_failed_knowledge = (
             queried_knowledge.task_to_former_failed_traces[task_info] if queried_knowledge is not None else []
@@ -67,8 +76,8 @@ class LLMFinetuneEvolvingStrategy(MultiProcessEvolvingStrategy):
             [
                 knowledge
                 for knowledge in queried_former_failed_knowledge[0]
-                if knowledge.implementation.file_dict.get(FT_YAML_FILE_NAME)
-                != workspace.file_dict.get(FT_YAML_FILE_NAME)
+                if knowledge.implementation.file_dict.get(target_file)
+                != workspace.file_dict.get(target_file)
             ],
             queried_former_failed_knowledge[1],
         )
@@ -76,18 +85,26 @@ class LLMFinetuneEvolvingStrategy(MultiProcessEvolvingStrategy):
         # Get task parameters from the task object
         base_model = getattr(target_task, "base_model")
 
-        # Use LLM to generate LlamaFactory config YAML
-        # Coder will decide method based on hypothesis and available parameters
-        config_yaml = self._generate_llamafactory_config_with_llm(
-            base_model=base_model,
-            task_info=task_info,
-            queried_former_failed_knowledge=queried_former_failed_knowledge,
-            prev_feedback=prev_task_feedback,
-            workspace=workspace,
-        )
-
-        # Return generated config directly - validation happens in evaluator
-        return {FT_YAML_FILE_NAME: config_yaml}
+        if task_type == "data":
+            # Generate data processing script (main.py) using COT-Self-Instruct
+            main_py = self._generate_data_processing_script_with_llm(
+                base_model=base_model,
+                task_info=task_info,
+                queried_former_failed_knowledge=queried_former_failed_knowledge,
+                prev_feedback=prev_task_feedback,
+                workspace=workspace,
+            )
+            return {DATA_MAIN_FILE_NAME: main_py}
+        else:
+            # Generate LlamaFactory config YAML (original logic)
+            config_yaml = self._generate_llamafactory_config_with_llm(
+                base_model=base_model,
+                task_info=task_info,
+                queried_former_failed_knowledge=queried_former_failed_knowledge,
+                prev_feedback=prev_task_feedback,
+                workspace=workspace,
+            )
+            return {FT_YAML_FILE_NAME: config_yaml}
 
     def _generate_llamafactory_config_with_llm(
         self,
@@ -163,6 +180,66 @@ class LLMFinetuneEvolvingStrategy(MultiProcessEvolvingStrategy):
         except Exception as e:
             logger.error(f"Failed to generate config with LLM: {e}")
             raise RuntimeError(f"LLM config generation failed: {e}")
+
+    def _generate_data_processing_script_with_llm(
+        self,
+        base_model: str,
+        task_info: str = "",
+        queried_former_failed_knowledge: tuple = None,
+        prev_feedback=None,
+        workspace=None,
+    ) -> str:
+        """Generate data processing script (main.py) using LLM for COT-Self-Instruct pipeline"""
+
+        # Get dataset info from scenario if available
+        dataset_info = ""
+        if hasattr(self.scen, "dataset_info"):
+            dataset_info = self.scen.dataset_info
+        elif hasattr(self.scen, "get_scenario_all_desc"):
+            dataset_info = "See scenario description above"
+
+        # Generate prompts using data-specific templates (COT-Self-Instruct)
+        system_prompt = T("rdagent.components.coder.finetune.data_prompts:data_coder.system").r(
+            scenario=self.scen.get_scenario_all_desc(),
+            task_desc=task_info,
+            queried_former_failed_knowledge=queried_former_failed_knowledge[0] if queried_former_failed_knowledge else [],
+        )
+
+        user_prompt = T("rdagent.components.coder.finetune.data_prompts:data_coder.user").r(
+            latest_code=workspace.file_dict.get(DATA_MAIN_FILE_NAME, "") if workspace else "",
+            latest_feedback=prev_feedback,
+            base_model=base_model,
+            dataset_info=dataset_info,
+        )
+
+        # Call LLM to generate script
+        try:
+            response = APIBackend().build_messages_and_create_chat_completion(
+                user_prompt=user_prompt,
+                system_prompt=system_prompt,
+                json_mode=False,
+            )
+
+            # Extract Python code from response
+            # Try markdown code block first
+            match = re.search(r"```(?:python)?\s*\n(.*?)\n```", response, re.DOTALL | re.IGNORECASE)
+            if match:
+                extracted_code = match.group(1).strip()
+                logger.info("Extracted Python code from markdown code block")
+                return extracted_code
+
+            # Fallback: try to use entire response as code
+            # Check if it looks like Python code
+            if "def " in response or "import " in response:
+                logger.info("Using entire response as Python code")
+                return response.strip()
+
+            logger.error("Failed to extract valid Python code from LLM response")
+            raise RuntimeError("Failed to extract valid Python code from LLM response")
+
+        except Exception as e:
+            logger.error(f"Failed to generate data processing script with LLM: {e}")
+            raise RuntimeError(f"LLM script generation failed: {e}")
 
     def assign_code_list_to_evo(self, code_list: list[dict[str, str]], evo):
         """Assign generated code to the evolving experiment"""

@@ -10,8 +10,10 @@ from rdagent.utils.env import (
     LocalEnv,
 )
 
+# File names for different task types
 FT_YAML_FILE_NAME = "train.yaml"
 FT_DEBUG_YAML_FILE_NAME = "debug_train.yaml"
+DATA_MAIN_FILE_NAME = "main.py"  # For data processing tasks
 
 
 class FTCoderCoSTEERSettings(CoSTEERSettings):
