@@ -10,6 +10,7 @@ from rdagent.scenarios.finetune.scen.llama_factory_manager import LLaMAFactory_m
 from rdagent.scenarios.finetune.scen.utils import (
     FinetuneDatasetDescriptor,
     generate_dataset_info_config,
+    get_dataset_folder_desc,
 )
 from rdagent.scenarios.finetune.utils import ensure_ft_assets_exist
 from rdagent.scenarios.shared.get_runtime_info import get_runtime_environment_by_env
@@ -38,7 +39,7 @@ class LLMFinetuneScen(DataScienceScen):
 
         # Generate dataset configuration
         self.data_info_json = self._prepare_dataset_info()
-
+        self.dataset_folder_desc = get_dataset_folder_desc(FT_RD_SETTING.file_path)
         # timeout tracking
         self.timeout_increase_count = 0
 
@@ -77,6 +78,7 @@ class LLMFinetuneScen(DataScienceScen):
         methods_count = len(info.get("methods", []))
         params_count = sum(len(p) if isinstance(p, dict) else 0 for p in info.get("parameters", {}).values())
         logger.info(f"LLaMA Factory initialized: {methods_count} methods, {params_count} parameters")
+
 
     def _prepare_dataset_info(self):
         """Generate dataset_info.json configuration"""
@@ -125,7 +127,7 @@ class LLMFinetuneScen(DataScienceScen):
         """Metric direction for LLM fine-tuning (higher is better)"""
         return True
 
-    def get_scenario_all_desc(self) -> str:
+    def get_scenario_all_desc(self,enable_dataset_description: bool = True) -> str:
         """Get complete scenario description for LLM fine-tuning"""
         return T(".prompts:scenario_description").r(
             user_target_scenario=self.user_target_scenario,
@@ -139,4 +141,6 @@ class LLMFinetuneScen(DataScienceScen):
             model_info=self.model_info,
             debug_timeout=f"{self.real_debug_timeout() / 60:.2f} minutes",
             full_timeout=f"{self.real_full_timeout() / 60 / 60:.2f} hours",
+            enable_dataset_description=enable_dataset_description,
         )
+
