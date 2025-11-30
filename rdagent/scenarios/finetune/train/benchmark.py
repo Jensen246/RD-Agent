@@ -1,0 +1,299 @@
+"""
+Benchmark Evaluation using OpenCompass
+
+Evaluator that runs OpenCompass in Docker to evaluate fine-tuned models on standard benchmarks.
+
+Configure benchmark behavior via editting .env to cover default settings in conf.py:
+```
+FT_BENCHMARK_DATASETS='["aime25", "gsm8k"]'
+FT_BENCHMARK_NUM_RUNS=4
+FT_JUDGE_MODEL="gpt-4"
+FT_JUDGE_API_KEY="sk-xxx"
+FT_JUDGE_API_BASE="https://api.openai.com/v1"
+```
+"""
+
+import json
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import pandas as pd
+import yaml
+from dotenv import find_dotenv, load_dotenv
+
+from rdagent.oai.llm_conf import LLM_SETTINGS
+from rdagent.utils.agent.tpl import T
+
+# Load .env file before importing settings
+load_dotenv(find_dotenv())
+
+from rdagent.app.finetune.llm.conf import FT_RD_SETTING
+from rdagent.components.coder.CoSTEER.evaluators import (
+    CoSTEEREvaluator,
+    CoSTEERSingleFeedback,
+)
+from rdagent.components.coder.finetune.conf import get_ft_env
+from rdagent.core.evolving_framework import QueriedKnowledge
+from rdagent.core.experiment import FBWorkspace, Task
+from rdagent.log import rdagent_logger as logger
+from rdagent.scenarios.shared.get_runtime_info import get_runtime_environment_by_env
+from rdagent.utils.env import BenchmarkDockerConf, BenchmarkDockerEnv
+
+BENCHMARK_CONFIG_DICT = {
+    # Math Reasoning Benchmarks
+    "aime24": "opencompass.configs.datasets.aime2024.aime2024_gen_17d799",
+    "aime25": "opencompass.configs.datasets.aime2025.aime2025_cascade_eval_gen_5e9f4f",
+    "aime2025": "opencompass.configs.datasets.aime2025.aime2025_cascade_eval_gen_5e9f4f",
+    "gsm8k": "opencompass.configs.datasets.gsm8k.gsm8k_gen_1d7fe4",
+    "math": "opencompass.configs.datasets.math.math_0shot_gen_393424",
+    # General Knowledge Benchmarks
+    "mmlu": "opencompass.configs.datasets.mmlu.mmlu_gen",
+    # Code Generation Benchmarks (examples, add as needed)
+    "humaneval": "opencompass.configs.datasets.humaneval.humaneval_gen",
+    "mbpp": "opencompass.configs.datasets.mbpp.mbpp_gen",
+}
+
+
+def _get_gpu_count() -> int:
+    device_info_json = json.loads(get_runtime_environment_by_env(get_ft_env()))
+    gpu_info = device_info_json.get("gpu", {})
+
+    if "gpu_count" in gpu_info:
+        return gpu_info["gpu_count"]
+
+    if "gpus" in gpu_info:
+        return len(gpu_info["gpus"])
+
+    return 0
+
+
+def get_model_inference_config(base_model_name: str) -> dict:
+    """
+    Load model inference configuration from YAML file.
+
+    Args:
+        base_model_name: HuggingFace model name (e.g., "Qwen/Qwen3-8B")
+
+    Returns:
+        dict: Merged configuration (model-specific overrides default)
+
+    Raises:
+        FileNotFoundError: If model_inference_configs.yaml not found
+    """
+    config_data = yaml.safe_load(open(Path(__file__).parent / "benchmark_configs" / "models.yaml", "r"))
+
+    final_config = {**config_data.get("default", {}), **config_data["models"].get(base_model_name)}
+
+    # Handle auto tensor_parallel_size
+    if final_config.get("tensor_parallel_size") == "auto":
+        num_gpus = _get_gpu_count()
+        if num_gpus <= 0:
+            final_config["tensor_parallel_size"] = 1
+        else:
+            power = 0
+            while (1 << (power + 1)) <= num_gpus:
+                power += 1
+            final_config["tensor_parallel_size"] = 1 << power
+
+    return final_config
+
+
+def detect_model_type(model_path: str) -> bool:
+    """
+    Detect whether the given model path corresponds to a LoRA adapter.
+
+    Returns:
+        True if LoRA adapter, False otherwise.
+    """
+    model_dir = Path(model_path)
+
+    # LoRA (llama-factory style)
+    if (model_dir / "adapter_config.json").exists():
+        return True
+
+    # Alternate LoRA file indicators
+    for fname in ("adapter_model.bin", "adapter_model.safetensors"):
+        if (model_dir / fname).exists():
+            return True
+
+    return False
+
+
+def run_benchmark(
+    workspace_path: str,
+    model_path: str,
+    model_name: str,
+    benchmark_name: str,
+    limit: Optional[int] = None,
+    num_runs: int = 1,
+    pass_k: Optional[List[int]] = None,
+) -> Dict[str, float]:
+    """
+    Run benchmark evaluation on a fine-tuned model.
+
+    Args:
+        workspace_path: Path to workspace directory
+        model_path: Path to fine-tuned model (supports full/LoRA auto-detection)
+        benchmark_name: Benchmark dataset name (e.g., "aime25", "gsm8k")
+        limit: Optional dataset size limit for testing
+        num_runs: Number of times to run each sample (default: 1)
+        pass_k: Optional list of k values for pass@k evaluation (e.g., [1, 5, 10])
+
+    Returns:
+        Dict[str, float]: Scores dictionary {task_name: score, ...}
+    """
+    # Load configurations
+    dataset_imports = BENCHMARK_CONFIG_DICT[benchmark_name]
+    model_is_lora = detect_model_type(model_path)
+    inference_config = get_model_inference_config(model_name)
+    workspace_path = Path(workspace_path)
+
+    model_dir_inside_docker = Path("/workspace/") / Path(model_path).relative_to(workspace_path)
+    if model_is_lora:
+        real_model_path = Path("/finetune/models") / model_name
+        real_lora_path = model_dir_inside_docker
+    else:
+        real_model_path = model_dir_inside_docker
+        real_lora_path = ""
+
+    # Prepare template variables (merge inference config from models.yaml)
+    template_vars = {
+        # Model configuration
+        "model_abbr": f"ft-{benchmark_name}",
+        "model_path": real_model_path,
+        "is_lora": model_is_lora,
+        "lora_path": real_lora_path,
+        # Dataset configuration
+        "dataset_imports": [dataset_imports],
+        "limit": limit or "",
+        "num_runs": num_runs,
+        "pass_k": pass_k,
+        "work_dir": model_dir_inside_docker,
+        # Merge all inference parameters from models.yaml (default + model-specific)
+        **inference_config,
+    }
+
+    # Render Jinja2 template
+    config_content = T("rdagent.scenarios.finetune.train.benchmark_configs.opencompass_template:template").r(
+        **template_vars
+    )
+
+    # Prepare Docker environment
+    conf = BenchmarkDockerConf()
+    conf.running_timeout_period = FT_RD_SETTING.benchmark_timeout
+    # Inline volume setup (merged _setup_benchmark_cache_volume and _setup_lora_volume)
+    extra_volumes: Dict[str, Dict[str, str]] = {}
+
+    # Finetune share folder mount
+    try:
+        (FT_RD_SETTING.file_path / "benchmarks").mkdir(parents=True, exist_ok=True)
+        extra_volumes[str(FT_RD_SETTING.file_path.resolve())] = {"bind": "/finetune", "mode": "rw"}
+    except (PermissionError, OSError) as e:
+        logger.warning(f"Cannot mount benchmark cache: {e}")
+
+    conf.extra_volumes = extra_volumes
+    env = BenchmarkDockerEnv(conf=conf)
+    env.prepare()
+
+    (workspace_path / "config.py").write_text(config_content)
+    docker_work_dir = "/workspace/benchmark_results"
+
+    # Logging
+    logger.info(f"Running benchmark '{benchmark_name}' on model: {model_path}")
+    logger.info(f"Base model: {model_name}, LoRA?: {model_is_lora}")
+    logger.info(f"Workspace: {workspace_path}")
+    logger.info(f"Docker work_dir: {docker_work_dir}")
+
+    # Environment variables
+    env_vars = {
+        "OC_JUDGE_MODEL": FT_RD_SETTING.judge_model or LLM_SETTINGS.chat_model,
+        "OC_JUDGE_API_KEY": FT_RD_SETTING.judge_api_key or LLM_SETTINGS.openai_api_key,
+        "OC_JUDGE_API_BASE": FT_RD_SETTING.judge_api_base or LLM_SETTINGS.openai_api_base,
+    }
+
+    # Check if results already exist (skip re-running if cached)
+    results_base = workspace_path / "benchmark_results"
+    timestamped_dirs = sorted([d for d in results_base.glob("202*_*") if d.is_dir()], reverse=True)
+
+    if timestamped_dirs:
+        logger.info(f"Found existing results in {timestamped_dirs[0].name}, skipping benchmark execution")
+    else:
+        # Run OpenCompass
+        entry_cmd = f"opencompass /workspace/config.py --work-dir {docker_work_dir}"
+
+        result = env.run(
+            entry=entry_cmd,
+            local_path=str(workspace_path),
+            env=env_vars,
+        )
+
+        # Check execution status
+        if result.exit_code != 0:
+            error_msg = result.stdout[-2000:] if result.stdout else "No output"
+            raise RuntimeError(f"Benchmark execution failed (exit_code={result.exit_code})\n{error_msg}")
+
+        # Re-scan for timestamped directories after execution
+        timestamped_dirs = sorted([d for d in results_base.glob("202*_*") if d.is_dir()], reverse=True)
+
+    # OpenCompass stores results in results/<model_name>/<dataset>.json
+    results_subdir = timestamped_dirs[0] / "summary"
+
+    results_csv_path = sorted([f for f in results_subdir.rglob("*.csv")], reverse=True)[0]
+    logger.info(f"Detailed results CSV: {results_csv_path.relative_to(results_base)}")
+
+    # Read and return CSV content
+    df = pd.read_csv(results_csv_path)
+    return df.to_dict("records")
+
+
+if __name__ == "__main__":
+    """Test benchmark evaluation on Qwen3-1.7B with LoRA adapter."""
+    # Configuration - Fill in your LoRA adapter path
+    LORA_ADAPTER_PATH = "/home/v-qizhengli/workspace/FT_workspace/gitignore_folder/B200/B200_FT_workspace/limo/train/b200_sweep_yamls/saves/qwen3-1.7b/lora_b200_lr1e-4_acc4/checkpoint-100"  # e.g., "/path/to/output/checkpoint-100"
+    BENCHMARK = "aime25"
+
+    print("=" * 80)
+    print("Benchmark Evaluation Test")
+    print("=" * 80)
+    print(f"\n📋 Environment: FT_JUDGE_API_KEY={'✅ Set' if FT_RD_SETTING.judge_api_key else '❌ Not Set'}")
+    print(f"   Judge API Base: {FT_RD_SETTING.judge_api_base or '❌ Not Set'}")
+
+    if LORA_ADAPTER_PATH is None:
+        print("\n⚠️  Please set LORA_ADAPTER_PATH to your LoRA checkpoint directory")
+        print('   Example: LORA_ADAPTER_PATH = "/workspace/output"')
+        exit(1)
+
+    print(f"\nModel: {LORA_ADAPTER_PATH}")
+    print(f"Benchmark: {BENCHMARK}")
+    print("-" * 80)
+
+    try:
+        # Create FBWorkspace for test (auto-generates UUID workspace)
+        test_task = Task(name=f"benchmark_test_{BENCHMARK}")
+        test_workspace = FBWorkspace(target_task=test_task)
+        test_workspace.prepare()
+
+        print(f"\n📁 Workspace: {test_workspace.workspace_path}")
+
+        # Set work_dir to workspace subdirectory
+        work_dir = str((test_workspace.workspace_path / "benchmark_results").resolve())
+
+        scores = run_benchmark(
+            model_path=LORA_ADAPTER_PATH,
+            benchmark_name=BENCHMARK,
+            work_dir=work_dir,
+        )
+
+        print("\n✅ Evaluation completed!")
+        for task, score in scores.items():
+            print(f"  {task}: {score:.2f}%")
+
+        avg_score = sum(scores.values()) / len(scores)
+        print(f"\nAverage Score: {avg_score:.2f}%")
+        print(f"\n📂 Results saved to: {work_dir}")
+
+    except Exception as e:
+        print(f"\n❌ Evaluation failed: {e}")
+        import traceback
+
+        traceback.print_exc()
